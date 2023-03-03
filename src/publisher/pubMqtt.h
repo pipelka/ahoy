@@ -37,7 +37,7 @@ struct alarm_t {
 template<class HMSYSTEM>
 class PubMqtt {
     public:
-        PubMqtt() {
+        PubMqtt() : jsonBuffer(512) {
             mRxCnt = 0;
             mTxCnt = 0;
             mSubscriptionCb = NULL;
@@ -59,7 +59,7 @@ class PubMqtt {
 
             if((strlen(mCfgMqtt->user) > 0) && (strlen(mCfgMqtt->pwd) > 0))
                 mClient.setCredentials(mCfgMqtt->user, mCfgMqtt->pwd);
-            snprintf(mClientId, 24, "%s-%s%s%s", mDevName, WiFi.macAddress().substring(9,11).c_str(), WiFi.macAddress().substring(12,14).c_str(), WiFi.macAddress().substring(15,17).c_str());
+            snprintf(mClientId, sizeof(mClientId), "%s-%s%s%s", mDevName, WiFi.macAddress().substring(9,11).c_str(), WiFi.macAddress().substring(12,14).c_str(), WiFi.macAddress().substring(15,17).c_str());
             mClient.setClientId(mClientId);
             mClient.setServer(mCfgMqtt->broker, mCfgMqtt->port);
             mClient.setWill(mLwtTopic, QOS_0, true, mqttStr[MQTT_STR_LWT_NOT_CONN]);
@@ -198,7 +198,8 @@ class PubMqtt {
             DPRINTLN(DBG_VERBOSE, F("sendMqttDiscoveryConfig"));
 
             char topic[64], name[32], uniq_id[32];
-            DynamicJsonDocument doc(256);
+            auto obj = jsonBuffer.to<JsonObject>();
+            auto deviceObj = jsonBuffer["dev"].as<JsonObject>();
 
             uint8_t fldTotal[4] = {FLD_PAC, FLD_YT, FLD_YD, FLD_PDC};
             const char* unitTotal[4] = {"W", "kWh", "Wh", "W"};
@@ -208,7 +209,6 @@ class PubMqtt {
             bool total = false;
 
             for (uint8_t id = 0; id < mSys->getNumInverters() ; id++) {
-                doc.clear();
 
                 if (total) // total become true at iv = NULL next cycle
                     continue;
@@ -219,19 +219,18 @@ class PubMqtt {
                 record_t<> *rec = iv->getRecordStruct(RealTimeRunData_Debug);
 
                 if (!total) {
-                    doc[F("name")] = iv->config->name;
-                    doc[F("ids")] = String(iv->config->serial.u64, HEX);
-                    doc[F("mdl")] = iv->config->name;
+                    deviceObj[F("name")] = iv->config->name;
+                    deviceObj[F("ids")] = String(iv->config->serial.u64, HEX);
+                    deviceObj[F("mdl")] = iv->config->name;
                 }
                 else {
-                    doc[F("name")] = node_id;
-                    doc[F("ids")] = node_id;
-                    doc[F("mdl")] = node_id;
+                    deviceObj[F("name")] = node_id;
+                    deviceObj[F("ids")] = node_id;
+                    deviceObj[F("mdl")] = node_id;
                 }
 
-                doc[F("cu")] = F("http://") + String(WiFi.localIP().toString());
-                doc[F("mf")] = F("Hoymiles");
-                JsonObject deviceObj = doc.as<JsonObject>(); // deviceObj is only pointer!?
+                deviceObj[F("cu")] = F("http://") + String(WiFi.localIP().toString());
+                deviceObj[F("mf")] = F("Hoymiles");
 
                 for (uint8_t i = 0; i < ((!total) ? (rec->length) : (4) ) ; i++) {
                     const char *devCls, *stateCls;
@@ -255,29 +254,29 @@ class PubMqtt {
                         stateCls = getFieldStateClass(fldTotal[i]);
                     }
 
-                    DynamicJsonDocument doc2(512);
-                    doc2[F("name")] = name;
-                    doc2[F("stat_t")] = String(mCfgMqtt->topic) + "/" + ((!total) ? String(iv->config->name) : "total" ) + String(topic);
-                    doc2[F("unit_of_meas")] = ((!total) ? (iv->getUnit(i,rec)) : (unitTotal[i]));
-                    doc2[F("uniq_id")] = ((!total) ? (String(iv->config->serial.u64, HEX)) : (node_id)) + "_" + uniq_id;
-                    doc2[F("dev")] = deviceObj;
+                    obj[F("name")] = name;
+                    obj[F("stat_t")] = String(mCfgMqtt->topic) + "/" + ((!total) ? String(iv->config->name) : "total" ) + String(topic);
+                    obj[F("unit_of_meas")] = ((!total) ? (iv->getUnit(i,rec)) : (unitTotal[i]));
+                    obj[F("uniq_id")] = ((!total) ? (String(iv->config->serial.u64, HEX)) : (node_id)) + "_" + uniq_id;
                     if (!(String(stateCls) == String("total_increasing")))
-                        doc2[F("exp_aft")] = MQTT_INTERVAL + 5;  // add 5 sec if connection is bad or ESP too slow @TODO: stimmt das wirklich als expire!?
+                        obj[F("exp_aft")] = MQTT_INTERVAL + 5;  // add 5 sec if connection is bad or ESP too slow @TODO: stimmt das wirklich als expire!?
                     if (devCls != NULL)
-                        doc2[F("dev_cla")] = String(devCls);
+                        obj[F("dev_cla")] = String(devCls);
                     if (stateCls != NULL)
-                        doc2[F("stat_cla")] = String(stateCls);
+                        obj[F("stat_cla")] = String(stateCls);
 
                     if (!total)
                         snprintf(topic, 64, "%s/sensor/%s/ch%d_%s/config", MQTT_DISCOVERY_PREFIX, iv->config->name, rec->assign[i].ch, iv->getFieldName(i, rec));
                     else // total values
                         snprintf(topic, 64, "%s/sensor/%s/total_%s/config", MQTT_DISCOVERY_PREFIX, node_id.c_str(),fields[fldTotal[i]]);
-                    size_t size = measureJson(doc2) + 1;
-                    char *buf = new char[size];
-                    memset(buf, 0, size);
-                    serializeJson(doc2, buf, size);
-                    publish(topic, buf, true, false);
-                    delete[] buf;
+                    size_t size = measureJson(obj) + 1;
+                    if(size > sizeof(mBuffer)) {
+                        DPRINT(DBG_ERROR, F("MQTT: message larger than buffer size"));
+                        continue;
+                    }
+                    memset(mBuffer, 0, size);
+                    serializeJson(obj, mBuffer, size);
+                    publish(topic, mBuffer, true, false);
                 }
 
                 yield();
@@ -346,8 +345,7 @@ class PubMqtt {
             if(NULL == mSubscriptionCb)
                 return;
 
-            DynamicJsonDocument json(128);
-            JsonObject root = json.to<JsonObject>();
+            JsonObject root = jsonBuffer.to<JsonObject>();
 
             if(len > 0) {
                 char *pyld = new char[len + 1];
@@ -606,6 +604,9 @@ class PubMqtt {
         bool mLastAnyAvail;
         uint8_t mLastIvState[MAX_NUM_INVERTERS];
         uint16_t mIntervalTimeout;
+
+        DynamicJsonDocument jsonBuffer;
+        char mBuffer[600];
 
         // last will topic and payload must be available trough lifetime of 'espMqttClient'
         char mLwtTopic[MQTT_TOPIC_LEN+5];
